@@ -133,6 +133,23 @@ class CitecueCrawlers
             return;
         }
 
+        // Cross-process lock so concurrent stale-registry requests don't
+        // stampede the API: one request refreshes, the rest keep serving with
+        // the existing registry.
+        $lock = self::acquireLock();
+        if ($lock === null) {
+            return;
+        }
+
+        // Re-check under the lock — another request may have just refreshed.
+        $stored = self::readStored();
+        $fetchedAt = ($stored && isset($stored['fetched_at'])) ? (int) $stored['fetched_at'] : 0;
+        if ($fetchedAt + self::REFRESH_TTL > time()) {
+            self::releaseLock($lock);
+
+            return;
+        }
+
         $response = CitecueClient::getCrawlers($apiBase);
         $crawlers = null;
         if ($response !== null && $response['status'] === 200) {
@@ -162,6 +179,40 @@ class CitecueCrawlers
         }
 
         Configuration::updateValue(self::CONF_REGISTRY, json_encode($snapshot));
+        self::releaseLock($lock);
+    }
+
+    /**
+     * Non-blocking cross-process lock for the registry refresh.
+     *
+     * @return resource|null lock handle, or null when another process holds it
+     */
+    private static function acquireLock()
+    {
+        $dir = (defined('_PS_CACHE_DIR_') ? _PS_CACHE_DIR_ : (rtrim(sys_get_temp_dir(), '/') . '/')) . 'citecue/';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        $handle = @fopen($dir . 'registry.lock', 'c');
+        if ($handle === false) {
+            return null;
+        }
+        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return null;
+        }
+
+        return $handle;
+    }
+
+    /**
+     * @param resource $handle
+     */
+    private static function releaseLock($handle)
+    {
+        flock($handle, LOCK_UN);
+        fclose($handle);
     }
 
     /**

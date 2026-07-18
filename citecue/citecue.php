@@ -42,7 +42,8 @@ class Citecue extends Module
         $this->author = 'CiteCue';
         $this->need_instance = 0;
         $this->bootstrap = true;
-        $this->ps_versions_compliancy = array('min' => '1.7.0.0', 'max' => _PS_VERSION_);
+        // actionDispatcherBefore was introduced in PrestaShop 1.7.1.0
+        $this->ps_versions_compliancy = array('min' => '1.7.1.0', 'max' => _PS_VERSION_);
 
         parent::__construct();
 
@@ -222,9 +223,19 @@ class Citecue extends Module
             $this->emit($entry['body'], 'text/plain; charset=utf-8', $entry['etag'], null, $method);
         }
 
-        // Disabled/unknown (404 sentinel): cache the miss so the shop 404s
-        // cheaply, matching the freshness window.
-        $cache->setNegative($cacheKey, self::LLMSTXT_FRESH_TTL);
+        if ($response['status'] === 404) {
+            // Disabled/unknown (the API's miss sentinel): cache the miss so
+            // the shop 404s cheaply, matching the freshness window.
+            $cache->setNegative($cacheKey, self::LLMSTXT_FRESH_TTL);
+
+            return;
+        }
+
+        // Transient upstream failure (429/5xx/unexpected): keep the cached
+        // entry and serve it stale when available; never poison the cache.
+        if ($entry !== null && $entry['body'] !== '') {
+            $this->emit($entry['body'], 'text/plain; charset=utf-8', $entry['etag'], null, $method);
+        }
     }
 
     /**

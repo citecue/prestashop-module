@@ -8,7 +8,7 @@ Auto-Fix pipeline. Regular visitors always get the normal PrestaShop pages.
 
 ## How it works
 
-```
+```text
 AI crawler ──▶ PrestaShop front controller
                  │  actionDispatcherBefore (this module, earliest front-office hook)
                  │
@@ -74,14 +74,15 @@ curl -s https://your-shop.example/llms.txt
 
 ## Requirements
 
-- PrestaShop 1.7.0+ (including 8.x / 9.x)
+- PrestaShop 1.7.1+ (including 8.x / 9.x) — the `actionDispatcherBefore` hook the
+  module relies on was introduced in 1.7.1.0
 - Outbound HTTPS from the shop server to the CiteCue API
   (default `https://app.citecue.com`; configurable for self-hosted instances)
 - PHP cURL extension recommended (a stream fallback is included)
 
 ## Module layout
 
-```
+```text
 citecue/
 ├── citecue.php                  # module: hooks, config page, serving logic
 ├── classes/
