@@ -19,10 +19,11 @@ AI crawler ──▶ PrestaShop front controller
                  │              X-Citecue-Channel: prestashop
                  │              If-None-Match: <cached ETag>
                  │
-                 │         200 ──▶ serve enhanced HTML, stop
+                 │         200 ──▶ serve enhanced HTML (or markdown), stop
                  │         304 ──▶ serve locally cached body, stop
                  │         404 ──▶ not optimized: cache miss 60 s, normal rendering
-                 │         timeout/error ──▶ fail open, normal rendering
+                 │         401 ──▶ key revoked: treated like 404
+                 │         timeout/5xx ──▶ skip the API for 60 s, normal rendering
 ```
 
 - **Serving + analytics in one call** — the v2 delivery endpoint records the
@@ -36,15 +37,37 @@ AI crawler ──▶ PrestaShop front controller
   degrades to normal PrestaShop rendering. Human traffic never waits on the
   CiteCue API: the crawler-registry refresh only runs on requests that already
   matched a crawler.
+- **Circuit breaker (60 s)** — after a timeout, a transport error, a 429 or a
+  5xx, the module skips the API for every URL of the project for 60 s, so an
+  API outage costs one timeout a minute instead of one per crawler request.
+  `/llms.txt` keeps serving its last good copy meanwhile.
+- **A revoked key turns delivery off** — a 401 is handled like a 404: pages
+  pass through and `/llms.txt` stops being served (no stale copy).
+- **Markdown for crawlers that ask for it** — the crawler's `Accept` header is
+  forwarded, so a crawler requesting `text/markdown` gets the markdown version
+  with its own `Content-Type`.
+- **Never cached by shared caches** — served crawler pages are sent with
+  `Cache-Control: private, no-store`.
 - **Crawler registry auto-refresh** — a snapshot of the CiteCue crawler
-  registry ships with the module and is refreshed every 6 h from the keyless
-  `GET /api/delivery/v1/crawlers` feed, so new crawlers are detected without a
-  module update.
+  registry ships with the module and is replaced every 6 h by the keyless
+  `GET /api/delivery/v1/crawlers` feed, so new crawlers are detected, and
+  crawlers CiteCue switches off stop being served, without a module update.
+  Matching is the CiteCue server's own: longest token wins across the whole
+  registry, robots.txt-only tokens (`Google-Extended`, `Applebot-Extended`)
+  included, and only crawlers that fetch pages are served.
 - **`/llms.txt`** — served from `GET /api/delivery/v2/llms.txt` (to every
   visitor, cached 5 min), when enabled both in the module and for the project
   in the CiteCue dashboard.
 - **No Host-header forwarding** — the URL sent to the API is built from the
   shop's configured domain, so a spoofed `Host` header can't be replayed.
+- **The API key stays put** — it is only ever sent over https to a trusted
+  host (`app.citecue.com`, plus hosts you add for a self-hosted instance),
+  never to a private, loopback, link-local or reserved IP address. The rule is
+  checked on Save and again before every request. The key is stored encrypted
+  with the shop's own key and never shown again in the settings page.
+- **Bounded cache** — expired entries are swept every 10 minutes and the cache
+  directory is capped at 5,000 entries, so faceted URLs (`?order=`, `?q=`,
+  `?page=`) can't grow it without limit.
 
 ## Installation
 
@@ -53,7 +76,8 @@ AI crawler ──▶ PrestaShop front controller
 2. In the back office: **Modules → Module Manager → Upload a module**.
 3. Open the module configuration:
    - paste your **organization API key** (`ck_live_…`) from the CiteCue
-     dashboard (*Settings → API keys*);
+     dashboard (*API & MCP access*). After saving, the field stays empty and
+     shows the key's prefix; leave it empty to keep the saved key;
    - the module auto-selects the CiteCue **project** matching your shop's
      domain (override the public key manually if needed);
    - flip **Serve enhanced pages to AI crawlers** to *Yes*.
@@ -72,12 +96,48 @@ curl -A "GPTBot" -sI https://your-shop.example/some-optimized-page/
 curl -s https://your-shop.example/llms.txt
 ```
 
+## Page caches and server caches
+
+The module answers crawlers in `actionDispatcherBefore`, inside PrestaShop.
+Anything that answers *before* PrestaShop runs also answers crawlers before
+the module sees them, and they get the regular cached page:
+
+- **Page-cache modules** (for example a full-page cache module from the
+  Addons marketplace) that serve cached HTML from an early hook or from a
+  front-controller override;
+- **Server and proxy caches** — LiteSpeed Cache, Varnish, nginx
+  `fastcgi_cache`, a CDN's cache rules.
+
+Exclude the AI crawler user agents from each of them. The tokens are:
+
+```text
+GPTBot OAI-SearchBot ChatGPT-User ClaudeBot Claude-User Claude-SearchBot
+anthropic-ai PerplexityBot Perplexity-User GoogleOther Bytespider CCBot
+cohere-ai meta-externalagent meta-externalfetcher Amazonbot DuckAssistBot
+MistralAI-User
+```
+
+For Varnish, in `vcl_recv`:
+
+```vcl
+if (req.http.User-Agent ~ "(?i)(GPTBot|OAI-SearchBot|ChatGPT-User|ClaudeBot|Claude-User|Claude-SearchBot|anthropic-ai|PerplexityBot|Perplexity-User|GoogleOther|Bytespider|CCBot|cohere-ai|meta-externalagent|meta-externalfetcher|Amazonbot|DuckAssistBot|MistralAI-User)") {
+    return (pass);
+}
+```
+
+For LiteSpeed, add the same tokens to the cache's *Do Not Cache User Agents*
+list (or an equivalent `.htaccess` rule). Without these exclusions crawlers
+only reach the module on cache misses. The responses the module serves are
+`Cache-Control: private, no-store`, so a cache never stores the crawler
+version for regular visitors.
+
 ## Requirements
 
 - PrestaShop 1.7.1+ (including 8.x / 9.x) — the `actionDispatcherBefore` hook the
   module relies on was introduced in 1.7.1.0
 - Outbound HTTPS from the shop server to the CiteCue API
-  (default `https://app.citecue.com`; configurable for self-hosted instances)
+  (default `https://app.citecue.com`; for a self-hosted instance set the API
+  base URL and add its host to *Trusted API hosts* — https only)
 - PHP cURL extension recommended (a stream fallback is included)
 
 ## Module layout
@@ -88,15 +148,28 @@ citecue/
 ├── classes/
 │   ├── CitecueClient.php        # HTTP client for the Delivery API (v2 + v1 registry)
 │   ├── CitecueCrawlers.php      # bundled + auto-refreshed crawler UA registry
-│   └── CitecueCache.php         # file cache: ETag bodies + negative misses
+│   ├── CitecueCache.php         # file cache: ETag bodies, misses, breaker, sweep
+│   ├── CitecueEndpoint.php      # which API base URLs may receive the key
+│   └── CitecueKeyStore.php      # API key, encrypted at rest, masked in the form
+├── upgrade/                     # upgrade-<version>.php scripts
 └── logo.png
 ```
 
+## Development
+
+The pure classes (`CitecueEndpoint`, `CitecueKeyStore`, `CitecueCrawlers`,
+`CitecueCache`, `CitecueClient::formatFor`) have tests that run on plain PHP,
+with no PrestaShop install and no Composer packages:
+
+```bash
+php tests/run.php
+```
+
+`tests/` is outside `citecue/`, so it never ships in the module zip.
+
 ## Notes
 
-- The module sends `X-Citecue-Channel: prestashop`. Until the CiteCue API adds
-  `prestashop` to its channel enum, hits are bucketed under the fallback
-  channel (`wordpress`) in the Agent Traffic channel split — everything else
-  (crawler ids, served/passthrough) is exact.
+- The module sends `X-Citecue-Channel: prestashop`, and the Agent Traffic
+  dashboard books its hits under `prestashop`.
 - Cached bodies live in `var/cache/…/citecue/` (`_PS_CACHE_DIR_`) and are
   cleared on settings change and uninstall.

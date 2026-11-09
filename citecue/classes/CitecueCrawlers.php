@@ -14,10 +14,12 @@ if (!defined('_PS_VERSION_')) {
  * AI crawler User-Agent registry.
  *
  * Mirrors the CiteCue delivery crawler registry (case-insensitive substring
- * match, longest token wins). A bundled snapshot ships with the module so
- * detection works with zero network calls; the live registry is refreshed
- * best-effort from the keyless `GET /api/delivery/v1/crawlers` feed so new
- * crawlers are picked up without a module update. The refresh only ever runs
+ * match over every token, longest token wins, served only when the winner
+ * fetches pages). A bundled snapshot ships with the module so detection works
+ * with zero network calls; the live registry is refreshed best-effort from the
+ * keyless `GET /api/delivery/v1/crawlers` feed and then replaces the snapshot,
+ * so new crawlers are picked up, and retired ones dropped, without a module
+ * update. The refresh only ever runs
  * on requests that already matched a crawler (or from the back office), so a
  * slow/unreachable API can never delay a regular visitor.
  */
@@ -32,74 +34,93 @@ class CitecueCrawlers
     const RETRY_TTL = 3600;
 
     /**
-     * Bundled snapshot of the CiteCue registry (crawlers that actually fetch
-     * pages; robots.txt-only tokens such as Google-Extended are excluded).
+     * Bundled snapshot of the CiteCue registry, used until the first feed
+     * refresh. It includes the robots.txt-only tokens (Google-Extended,
+     * Applebot-Extended): they never fetch pages, but they take part in the
+     * longest-token match so a UA naming one of them is not served, exactly
+     * as on the CiteCue side.
      *
-     * @return array<int, array{id: string, token: string}>
+     * @return array<int, array{id: string, token: string, fetchesPages: bool}>
      */
     public static function defaults()
     {
-        return array(
-            array('id' => 'gptbot', 'token' => 'GPTBot'),
-            array('id' => 'oai-searchbot', 'token' => 'OAI-SearchBot'),
-            array('id' => 'chatgpt-user', 'token' => 'ChatGPT-User'),
-            array('id' => 'claudebot', 'token' => 'ClaudeBot'),
-            array('id' => 'claude-user', 'token' => 'Claude-User'),
-            array('id' => 'claude-searchbot', 'token' => 'Claude-SearchBot'),
-            array('id' => 'anthropic-ai', 'token' => 'anthropic-ai'),
-            array('id' => 'perplexitybot', 'token' => 'PerplexityBot'),
-            array('id' => 'perplexity-user', 'token' => 'Perplexity-User'),
-            array('id' => 'googleother', 'token' => 'GoogleOther'),
-            array('id' => 'bytespider', 'token' => 'Bytespider'),
-            array('id' => 'ccbot', 'token' => 'CCBot'),
-            array('id' => 'cohere-ai', 'token' => 'cohere-ai'),
-            array('id' => 'meta-externalagent', 'token' => 'meta-externalagent'),
-            array('id' => 'meta-externalfetcher', 'token' => 'meta-externalfetcher'),
-            array('id' => 'amazonbot', 'token' => 'Amazonbot'),
-            array('id' => 'duckassistbot', 'token' => 'DuckAssistBot'),
-            array('id' => 'mistralai-user', 'token' => 'MistralAI-User'),
+        $rows = array(
+            array('gptbot', 'GPTBot', true),
+            array('oai-searchbot', 'OAI-SearchBot', true),
+            array('chatgpt-user', 'ChatGPT-User', true),
+            array('claudebot', 'ClaudeBot', true),
+            array('claude-user', 'Claude-User', true),
+            array('claude-searchbot', 'Claude-SearchBot', true),
+            array('anthropic-ai', 'anthropic-ai', true),
+            array('perplexitybot', 'PerplexityBot', true),
+            array('perplexity-user', 'Perplexity-User', true),
+            array('google-extended', 'Google-Extended', false),
+            array('googleother', 'GoogleOther', true),
+            array('bytespider', 'Bytespider', true),
+            array('ccbot', 'CCBot', true),
+            array('cohere-ai', 'cohere-ai', true),
+            array('meta-externalagent', 'meta-externalagent', true),
+            array('meta-externalfetcher', 'meta-externalfetcher', true),
+            array('amazonbot', 'Amazonbot', true),
+            array('applebot-extended', 'Applebot-Extended', false),
+            array('duckassistbot', 'DuckAssistBot', true),
+            array('mistralai-user', 'MistralAI-User', true),
         );
+        $crawlers = array();
+        foreach ($rows as $row) {
+            $crawlers[] = array('id' => $row[0], 'token' => $row[1], 'fetchesPages' => $row[2]);
+        }
+
+        return $crawlers;
     }
 
     /**
-     * The active registry: the stored live snapshot when one exists, merged
-     * over the bundled defaults (so a truncated remote list can never disable
-     * detection of a bundled crawler).
+     * The active registry: the stored feed snapshot when one was ever
+     * stored, otherwise the bundled defaults. The feed replaces the defaults
+     * entirely, so the app can switch a bundled crawler off (fetchesPages:
+     * false) or drop it.
      *
-     * @return array<int, array{id: string, token: string}>
+     * @return array<int, array{id: string, token: string, fetchesPages: bool}>
      */
     public static function all()
     {
-        $byId = array();
-        foreach (self::defaults() as $crawler) {
-            $byId[$crawler['id']] = $crawler;
-        }
-
         $stored = self::readStored();
         if ($stored && !empty($stored['crawlers']) && is_array($stored['crawlers'])) {
-            foreach ($stored['crawlers'] as $crawler) {
-                if (!empty($crawler['id']) && !empty($crawler['token'])) {
-                    $byId[(string) $crawler['id']] = array(
-                        'id' => (string) $crawler['id'],
-                        'token' => (string) $crawler['token'],
-                    );
-                }
+            $crawlers = self::sanitize($stored['crawlers']);
+            if ($crawlers) {
+                return $crawlers;
             }
         }
 
-        return array_values($byId);
+        return self::defaults();
     }
 
     /**
-     * Matches a User-Agent against the registry. Case-insensitive substring
-     * match; when several tokens match, the longest wins (same rule as the
-     * CiteCue server, so e.g. ChatGPT-User is never shadowed by GPTBot).
+     * Matches a User-Agent against the whole registry, robots-only tokens
+     * included: case-insensitive substring match, the longest matching token
+     * wins (the CiteCue server's rule, so e.g. ChatGPT-User is never shadowed
+     * by GPTBot). Returns the winner only when it actually fetches pages.
      *
      * @param string|null $userAgent
      *
-     * @return array{id: string, token: string}|null
+     * @return array{id: string, token: string, fetchesPages: bool}|null
      */
     public static function match($userAgent)
+    {
+        $best = self::matchAny($userAgent);
+
+        return ($best !== null && $best['fetchesPages']) ? $best : null;
+    }
+
+    /**
+     * Longest-token match over the whole registry, without the serve
+     * decision.
+     *
+     * @param string|null $userAgent
+     *
+     * @return array{id: string, token: string, fetchesPages: bool}|null
+     */
+    public static function matchAny($userAgent)
     {
         if (!is_string($userAgent) || $userAgent === '') {
             return null;
@@ -119,18 +140,54 @@ class CitecueCrawlers
     }
 
     /**
+     * Normalizes feed or stored rows to {id, token, fetchesPages}. A row
+     * without the flag counts as fetching (the 1.0.0 snapshot only stored
+     * fetching rows, without the flag); a row with any value other than a
+     * literal true is not fetching, so a malformed "false" can never switch
+     * serving on.
+     *
+     * @param array $rows
+     *
+     * @return array<int, array{id: string, token: string, fetchesPages: bool}>
+     */
+    public static function sanitize(array $rows)
+    {
+        $crawlers = array();
+        foreach ($rows as $row) {
+            if (!is_array($row) || !isset($row['id'], $row['token']) || !is_scalar($row['id']) || !is_scalar($row['token'])) {
+                continue;
+            }
+            $id = trim((string) $row['id']);
+            $token = trim((string) $row['token']);
+            if ($id === '' || $token === '') {
+                continue;
+            }
+            $crawlers[] = array(
+                'id' => $id,
+                'token' => $token,
+                'fetchesPages' => !array_key_exists('fetchesPages', $row) || $row['fetchesPages'] === true,
+            );
+        }
+
+        return $crawlers;
+    }
+
+    /**
      * Refreshes the stored registry from the keyless crawler feed when the
      * snapshot is older than REFRESH_TTL. Failures are silent and retried
      * after RETRY_TTL. Safe to call on the crawler-serving hot path.
      *
      * @param string $apiBase
+     *
+     * @return bool false when a refresh ran and found the API down
+     *              (transport failure, 429 or 5xx), true otherwise
      */
     public static function maybeRefresh($apiBase)
     {
         $stored = self::readStored();
         $fetchedAt = ($stored && isset($stored['fetched_at'])) ? (int) $stored['fetched_at'] : 0;
         if ($fetchedAt + self::REFRESH_TTL > time()) {
-            return;
+            return true;
         }
 
         // Cross-process lock so concurrent stale-registry requests don't
@@ -138,7 +195,7 @@ class CitecueCrawlers
         // the existing registry.
         $lock = self::acquireLock();
         if ($lock === null) {
-            return;
+            return true;
         }
 
         // Re-check under the lock — another request may have just refreshed.
@@ -147,7 +204,7 @@ class CitecueCrawlers
         if ($fetchedAt + self::REFRESH_TTL > time()) {
             self::releaseLock($lock);
 
-            return;
+            return true;
         }
 
         $response = CitecueClient::getCrawlers($apiBase);
@@ -155,16 +212,10 @@ class CitecueCrawlers
         if ($response !== null && $response['status'] === 200) {
             $decoded = json_decode($response['body'], true);
             if (is_array($decoded) && isset($decoded['crawlers']) && is_array($decoded['crawlers'])) {
-                $crawlers = array();
-                foreach ($decoded['crawlers'] as $crawler) {
-                    if (!is_array($crawler) || empty($crawler['id']) || empty($crawler['token'])) {
-                        continue;
-                    }
-                    if (array_key_exists('fetchesPages', $crawler) && !$crawler['fetchesPages']) {
-                        continue;
-                    }
-                    $crawlers[] = array('id' => (string) $crawler['id'], 'token' => (string) $crawler['token']);
-                }
+                // Keep every row with its fetchesPages flag: robots-only
+                // tokens take part in matching, and a crawler the feed marks
+                // as not fetching must stop being served.
+                $crawlers = self::sanitize($decoded['crawlers']);
             }
         }
 
@@ -180,6 +231,8 @@ class CitecueCrawlers
 
         Configuration::updateValue(self::CONF_REGISTRY, json_encode($snapshot));
         self::releaseLock($lock);
+
+        return !($response === null || $response['status'] === 429 || $response['status'] >= 500);
     }
 
     /**
