@@ -17,10 +17,15 @@ if (!defined('_PS_VERSION_')) {
  * org-scoped; the v1 crawler registry feed is keyless. All timeouts are tight
  * because the page endpoint sits on the front-office request path — a slow
  * API must degrade to a passthrough, never a slow page.
+ *
+ * No request leaves unless the base URL passes CitecueEndpoint (https, a
+ * trusted host, no private or reserved IP literal), so the Bearer key can't
+ * be sent in cleartext or to an internal address even if the stored setting
+ * was changed behind the module's back.
  */
 class CitecueClient
 {
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const CHANNEL = 'prestashop';
 
     /**
@@ -34,6 +39,10 @@ class CitecueClient
      */
     public static function getConfig($apiBase, $apiKey)
     {
+        if (!CitecueEndpoint::isConfiguredAllowed($apiBase)) {
+            return null;
+        }
+
         return self::request(
             self::url($apiBase, '/api/delivery/v2/config'),
             self::baseHeaders($apiKey),
@@ -54,18 +63,27 @@ class CitecueClient
      * @param string $url absolute URL of the current shop request
      * @param string|null $crawlerId matched crawler id (analytics bucket)
      * @param string|null $etag cached ETag for conditional revalidation
+     * @param string|null $accept the crawler's Accept header, forwarded so the
+     *                            API can answer markdown to a crawler asking for it
      *
      * @return array{status: int, headers: array<string, string>, body: string}|null
      */
-    public static function getPage($apiBase, $apiKey, $projectKey, $url, $crawlerId, $etag)
+    public static function getPage($apiBase, $apiKey, $projectKey, $url, $crawlerId, $etag, $accept = null)
     {
+        if (!CitecueEndpoint::isConfiguredAllowed($apiBase)) {
+            return null;
+        }
         $query = array('k' => $projectKey, 'u' => $url);
         if ($crawlerId) {
             $query['b'] = $crawlerId;
         }
         $headers = self::baseHeaders($apiKey);
         if ($etag) {
-            $headers[] = 'If-None-Match: ' . $etag;
+            $headers[] = 'If-None-Match: ' . self::headerValue($etag);
+        }
+        $accept = self::headerValue((string) $accept);
+        if ($accept !== '') {
+            $headers[] = 'Accept: ' . $accept;
         }
 
         return self::request(
@@ -89,9 +107,12 @@ class CitecueClient
      */
     public static function getLlmsTxt($apiBase, $apiKey, $projectKey, $etag)
     {
+        if (!CitecueEndpoint::isConfiguredAllowed($apiBase)) {
+            return null;
+        }
         $headers = self::baseHeaders($apiKey);
         if ($etag) {
-            $headers[] = 'If-None-Match: ' . $etag;
+            $headers[] = 'If-None-Match: ' . self::headerValue($etag);
         }
 
         return self::request(
@@ -111,12 +132,60 @@ class CitecueClient
      */
     public static function getCrawlers($apiBase)
     {
+        if (!CitecueEndpoint::isConfiguredAllowed($apiBase)) {
+            return null;
+        }
+
         return self::request(
             self::url($apiBase, '/api/delivery/v1/crawlers'),
             array('Accept: application/json', 'User-Agent: ' . self::userAgent()),
             4000,
             2000
         );
+    }
+
+    /**
+     * Which representation the API will pick for this Accept header, using
+     * the API's own rule: markdown when a `text/markdown` range with q > 0 is
+     * listed, html otherwise (wildcards don't count). Only used to keep the
+     * local cache entries of the two representations apart.
+     *
+     * @param string|null $accept
+     *
+     * @return string 'markdown' or 'html'
+     */
+    public static function formatFor($accept)
+    {
+        foreach (explode(',', (string) $accept) as $range) {
+            $params = array_map('trim', explode(';', $range));
+            if (strtolower($params[0]) !== 'text/markdown') {
+                continue;
+            }
+            $q = 1.0;
+            foreach (array_slice($params, 1) as $param) {
+                $pair = array_map('trim', explode('=', $param, 2));
+                if (strtolower($pair[0]) === 'q' && isset($pair[1]) && is_numeric($pair[1])) {
+                    $q = (float) $pair[1];
+                }
+            }
+            if ($q > 0) {
+                return 'markdown';
+            }
+        }
+
+        return 'html';
+    }
+
+    /**
+     * A single-line header value: control characters removed, length capped.
+     *
+     * @param string $value
+     *
+     * @return string
+     */
+    private static function headerValue($value)
+    {
+        return trim(substr((string) preg_replace('/[\x00-\x1F\x7F]/', '', (string) $value), 0, 1024));
     }
 
     /**
@@ -144,7 +213,7 @@ class CitecueClient
     private static function baseHeaders($apiKey)
     {
         return array(
-            'Authorization: Bearer ' . $apiKey,
+            'Authorization: Bearer ' . self::headerValue($apiKey),
             'X-Citecue-Channel: ' . self::CHANNEL,
             'User-Agent: ' . self::userAgent(),
         );
@@ -200,6 +269,7 @@ class CitecueClient
             CURLOPT_TIMEOUT_MS => $timeoutMs,
             CURLOPT_CONNECTTIMEOUT_MS => $connectTimeoutMs,
             CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$responseHeaders) {
@@ -214,7 +284,10 @@ class CitecueClient
 
         $body = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) {
+            // a no-op since PHP 8.0, deprecated in 8.5
+            curl_close($ch);
+        }
 
         if ($body === false || $status === 0) {
             return null;
@@ -251,8 +324,15 @@ class CitecueClient
 
         $status = 0;
         $responseHeaders = array();
-        if (isset($http_response_header) && is_array($http_response_header)) {
-            foreach ($http_response_header as $line) {
+        if (function_exists('http_get_last_response_headers')) {
+            // PHP 8.4+; the magic local variable is deprecated in 8.5
+            $lines = http_get_last_response_headers();
+        } else {
+            $scope = get_defined_vars();
+            $lines = isset($scope['http_response_header']) ? $scope['http_response_header'] : null;
+        }
+        if (is_array($lines)) {
+            foreach ($lines as $line) {
                 if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $m)) {
                     $status = (int) $m[1];
                     $responseHeaders = array();

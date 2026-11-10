@@ -22,12 +22,27 @@ if (!defined('_PS_VERSION_')) {
  *    hit is recorded).
  *  - negative: a short-lived "not optimized" marker mirroring the API's 404
  *    miss `max-age`, so unoptimized pages don't trigger an API call per
- *    crawler request.
+ *    crawler request. The per-project circuit breaker is a negative entry
+ *    too.
+ *
+ * Every distinct crawled URL leaves an entry, and an entry is otherwise only
+ * removed when that same URL is read again, so sweep() runs every
+ * SWEEP_INTERVAL on the crawler path: it deletes expired entries and
+ * abandoned temp files, then caps the directory at MAX_FILES.
  */
 class CitecueCache
 {
     /** Positive entries older than this are discarded on read (seconds). */
     const MAX_ENTRY_AGE = 2592000;
+
+    /** Minimum seconds between two sweeps. */
+    const SWEEP_INTERVAL = 600;
+
+    /** Entry count the sweep trims the directory down to, oldest first. */
+    const MAX_FILES = 5000;
+
+    /** Entries up to this size are parsed by the sweep; larger ones are aged by mtime. */
+    const SWEEP_PARSE_BYTES = 4096;
 
     /** @var string */
     private $dir;
@@ -87,8 +102,9 @@ class CitecueCache
      * @param string $body
      * @param string|null $mode
      * @param int $freshTtl seconds the entry may be served without revalidation (0 = always revalidate)
+     * @param string|null $contentType the API's Content-Type for the body
      */
-    public function setPositive($key, $etag, $body, $mode, $freshTtl = 0)
+    public function setPositive($key, $etag, $body, $mode, $freshTtl = 0, $contentType = null)
     {
         $this->write($key, array(
             'miss' => false,
@@ -96,6 +112,7 @@ class CitecueCache
             // base64 keeps the entry json-safe regardless of the body's encoding
             'body' => base64_encode($body),
             'mode' => $mode,
+            'type' => $contentType,
             'stored_at' => time(),
             'expires' => $freshTtl > 0 ? time() + $freshTtl : 0,
         ));
@@ -124,7 +141,8 @@ class CitecueCache
             isset($entry['etag']) ? $entry['etag'] : null,
             isset($entry['body']) ? $entry['body'] : '',
             isset($entry['mode']) ? $entry['mode'] : null,
-            $freshTtl
+            $freshTtl,
+            isset($entry['type']) ? $entry['type'] : null
         );
     }
 
@@ -146,6 +164,131 @@ class CitecueCache
                 @unlink($file);
             }
         }
+    }
+
+    /**
+     * Runs sweep() when the last one is older than SWEEP_INTERVAL. Only one
+     * process sweeps at a time; the others skip it without waiting.
+     *
+     * @return int|null files removed, or null when no sweep ran
+     */
+    public static function maybeSweep()
+    {
+        $cache = new self();
+        $stamp = $cache->dir . 'sweep.stamp';
+        $last = @filemtime($stamp);
+        if ($last !== false && $last + self::SWEEP_INTERVAL > time()) {
+            return null;
+        }
+        if (!is_dir($cache->dir)) {
+            return null;
+        }
+        $handle = @fopen($cache->dir . 'sweep.lock', 'c');
+        if ($handle === false) {
+            return null;
+        }
+        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return null;
+        }
+        clearstatcache(true, $stamp);
+        $last = @filemtime($stamp);
+        $removed = null;
+        if ($last === false || $last + self::SWEEP_INTERVAL <= time()) {
+            @touch($stamp);
+            $removed = $cache->sweep();
+        }
+        flock($handle, LOCK_UN);
+        fclose($handle);
+
+        return $removed;
+    }
+
+    /**
+     * Deletes expired entries and abandoned temp files, then trims the
+     * directory to MAX_FILES entries, oldest first.
+     *
+     * @param int|null $now
+     *
+     * @return int files removed
+     */
+    public function sweep($now = null)
+    {
+        $now = $now === null ? time() : (int) $now;
+        $removed = 0;
+
+        $temps = @glob($this->dir . '*.tmp');
+        foreach (is_array($temps) ? $temps : array() as $file) {
+            $mtime = @filemtime($file);
+            if ($mtime !== false && $mtime + 3600 < $now && @unlink($file)) {
+                ++$removed;
+            }
+        }
+
+        $files = @glob($this->dir . '*.json');
+        if (!is_array($files)) {
+            return $removed;
+        }
+        $kept = array();
+        foreach ($files as $file) {
+            $mtime = @filemtime($file);
+            if ($mtime === false) {
+                continue;
+            }
+            if ($this->isExpiredFile($file, $mtime, $now)) {
+                if (@unlink($file)) {
+                    ++$removed;
+                }
+                continue;
+            }
+            $kept[$file] = $mtime;
+        }
+
+        $excess = count($kept) - self::MAX_FILES;
+        if ($excess > 0) {
+            asort($kept);
+            foreach (array_keys($kept) as $file) {
+                if ($excess <= 0) {
+                    break;
+                }
+                if (@unlink($file)) {
+                    ++$removed;
+                }
+                --$excess;
+            }
+        }
+
+        return $removed;
+    }
+
+    /**
+     * @param string $file
+     * @param int $mtime
+     * @param int $now
+     *
+     * @return bool
+     */
+    private function isExpiredFile($file, $mtime, $now)
+    {
+        // Entries are rewritten whole, so the mtime is the store time.
+        if ($mtime + self::MAX_ENTRY_AGE < $now) {
+            return true;
+        }
+        $size = @filesize($file);
+        if ($size === false || $size > self::SWEEP_PARSE_BYTES) {
+            // a large positive entry: only MAX_ENTRY_AGE applies
+            return false;
+        }
+        $entry = json_decode((string) @file_get_contents($file), true);
+        if (!is_array($entry)) {
+            return true;
+        }
+        if (!empty($entry['miss'])) {
+            return !isset($entry['expires']) || (int) $entry['expires'] < $now;
+        }
+
+        return isset($entry['stored_at']) && (int) $entry['stored_at'] + self::MAX_ENTRY_AGE < $now;
     }
 
     /**

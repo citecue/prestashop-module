@@ -14,6 +14,8 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
+require_once __DIR__ . '/classes/CitecueEndpoint.php';
+require_once __DIR__ . '/classes/CitecueKeyStore.php';
 require_once __DIR__ . '/classes/CitecueClient.php';
 require_once __DIR__ . '/classes/CitecueCrawlers.php';
 require_once __DIR__ . '/classes/CitecueCache.php';
@@ -22,23 +24,30 @@ class Citecue extends Module
 {
     const CONF_ENABLED = 'CITECUE_ENABLED';
     const CONF_API_BASE = 'CITECUE_API_BASE';
-    const CONF_API_KEY = 'CITECUE_API_KEY';
+    const CONF_API_KEY = CitecueKeyStore::CONF_KEY;
     const CONF_PROJECT_KEY = 'CITECUE_PROJECT_KEY';
     const CONF_LLMSTXT = 'CITECUE_LLMSTXT';
+    const CONF_ALLOWED_HOSTS = CitecueEndpoint::CONF_ALLOWED_HOSTS;
 
-    const DEFAULT_API_BASE = 'https://app.citecue.com';
+    const DEFAULT_API_BASE = CitecueEndpoint::DEFAULT_BASE;
 
     /** Freshness window for the locally cached llms.txt body (seconds). */
     const LLMSTXT_FRESH_TTL = 300;
 
-    /** Negative-cache TTL for page misses, mirrors the API's 404 max-age. */
+    /** Negative-cache TTL for misses, mirrors the API's 404 max-age. */
     const MISS_TTL = 60;
+
+    /** How long the API is skipped after a transport failure or 5xx (seconds). */
+    const BREAKER_TTL = 60;
+
+    /** Served crawler pages must never be stored by a shared cache. */
+    const PAGE_CACHE_CONTROL = 'private, no-store';
 
     public function __construct()
     {
         $this->name = 'citecue';
         $this->tab = 'seo';
-        $this->version = '1.0.0';
+        $this->version = '1.1.0';
         $this->author = 'CiteCue';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -58,13 +67,14 @@ class Citecue extends Module
             && $this->registerHook('actionDispatcherBefore')
             && Configuration::updateValue(self::CONF_ENABLED, 0)
             && Configuration::updateValue(self::CONF_API_BASE, self::DEFAULT_API_BASE)
+            && Configuration::updateValue(self::CONF_ALLOWED_HOSTS, '')
             && Configuration::updateValue(self::CONF_LLMSTXT, 1);
     }
 
     public function uninstall()
     {
         CitecueCache::clearAll();
-        foreach (array(self::CONF_ENABLED, self::CONF_API_BASE, self::CONF_API_KEY, self::CONF_PROJECT_KEY, self::CONF_LLMSTXT, CitecueCrawlers::CONF_REGISTRY) as $key) {
+        foreach (array(self::CONF_ENABLED, self::CONF_API_BASE, self::CONF_API_KEY, self::CONF_PROJECT_KEY, self::CONF_LLMSTXT, self::CONF_ALLOWED_HOSTS, CitecueCrawlers::CONF_REGISTRY) as $key) {
             Configuration::deleteByName($key);
         }
 
@@ -106,9 +116,15 @@ class Citecue extends Module
             return;
         }
 
-        $apiKey = trim((string) Configuration::get(self::CONF_API_KEY));
+        $apiKey = CitecueKeyStore::get();
         $projectKey = trim((string) Configuration::get(self::CONF_PROJECT_KEY));
         if ($apiKey === '' || $projectKey === '') {
+            return;
+        }
+        // Re-checked on every request, not only on Save: a base URL that is
+        // not https on a trusted host never receives the key.
+        $apiBase = $this->apiBase();
+        if ($apiBase === null) {
             return;
         }
 
@@ -116,7 +132,7 @@ class Citecue extends Module
         $path = (string) parse_url($requestUri, PHP_URL_PATH);
 
         if (Configuration::get(self::CONF_LLMSTXT) && $this->isLlmsTxtPath($path)) {
-            $this->serveLlmsTxt($apiKey, $projectKey, $method);
+            $this->serveLlmsTxt($apiBase, $apiKey, $projectKey, $method);
 
             return;
         }
@@ -127,27 +143,44 @@ class Citecue extends Module
             return;
         }
 
-        $apiBase = $this->apiBase();
+        $accept = isset($_SERVER['HTTP_ACCEPT']) ? (string) $_SERVER['HTTP_ACCEPT'] : '';
         $url = $this->currentAbsoluteUrl($requestUri);
         $cache = new CitecueCache();
-        $cacheKey = 'page|' . $projectKey . '|' . $url;
+        // The two representations (html, markdown) are cached apart.
+        $cacheKey = 'page|' . $projectKey . '|' . CitecueClient::formatFor($accept) . '|' . $url;
 
         $entry = $cache->get($cacheKey);
         if ($entry !== null && !empty($entry['miss'])) {
             return;
         }
+        if ($this->isBreakerOpen($cache, $projectKey)) {
+            // The API failed within the last minute: pass through without
+            // waiting on it again.
+            return;
+        }
 
-        // Registry refresh only ever runs here, after a crawler already
-        // matched — a regular visitor never waits on the CiteCue API.
-        CitecueCrawlers::maybeRefresh($apiBase);
+        // Registry refresh and cache sweep only ever run here, after a
+        // crawler already matched — a regular visitor never waits on them.
+        CitecueCache::maybeSweep();
+        if (!CitecueCrawlers::maybeRefresh($apiBase)) {
+            // The refresh just found the API down: don't wait on it twice.
+            $this->tripBreaker($cache, $projectKey);
+
+            return;
+        }
+        // A refresh may just have switched this crawler off.
+        $crawler = CitecueCrawlers::match($userAgent);
+        if ($crawler === null) {
+            return;
+        }
 
         $etag = ($entry !== null && !empty($entry['etag']) && $entry['body'] !== '') ? $entry['etag'] : null;
-        $response = CitecueClient::getPage($apiBase, $apiKey, $projectKey, $url, $crawler['id'], $etag);
+        $response = CitecueClient::getPage($apiBase, $apiKey, $projectKey, $url, $crawler['id'], $etag, $accept);
 
-        if ($response === null) {
-            // API unreachable: brief negative cache shields the shop from
-            // repeated blocking lookups, then fail open.
-            $cache->setNegative($cacheKey, self::MISS_TTL);
+        if ($response === null || $this->isOutage($response['status'])) {
+            // API unreachable or failing: skip it for every URL of this
+            // project for BREAKER_TTL, then fail open.
+            $this->tripBreaker($cache, $projectKey);
 
             return;
         }
@@ -155,12 +188,14 @@ class Citecue extends Module
         if ($response['status'] === 200 && $response['body'] !== '') {
             $newEtag = isset($response['headers']['etag']) ? $response['headers']['etag'] : null;
             $mode = isset($response['headers']['x-citecue-mode']) ? $response['headers']['x-citecue-mode'] : null;
-            $cache->setPositive($cacheKey, $newEtag, $response['body'], $mode);
-            $this->emit($response['body'], 'text/html; charset=utf-8', $newEtag, $mode, $method);
+            $type = $this->pageContentType(isset($response['headers']['content-type']) ? $response['headers']['content-type'] : null);
+            $cache->setPositive($cacheKey, $newEtag, $response['body'], $mode, 0, $type);
+            $this->emit($response['body'], $type, $newEtag, $mode, $method, self::PAGE_CACHE_CONTROL);
         }
 
         if ($response['status'] === 304 && $entry !== null && $entry['body'] !== '') {
-            $this->emit($entry['body'], 'text/html; charset=utf-8', $entry['etag'], isset($entry['mode']) ? $entry['mode'] : null, $method);
+            $type = $this->pageContentType(isset($entry['type']) ? $entry['type'] : null);
+            $this->emit($entry['body'], $type, $entry['etag'], isset($entry['mode']) ? $entry['mode'] : null, $method, self::PAGE_CACHE_CONTROL);
         }
 
         if ($response['status'] === 304) {
@@ -171,8 +206,9 @@ class Citecue extends Module
             return;
         }
 
-        // 404 miss sentinel (or any other status): this URL has no enhanced
-        // version — mirror the API's short miss TTL, then passthrough.
+        // 404 miss sentinel, 401 (key revoked: the merchant turned delivery
+        // off) or any other client error: this URL has no enhanced version —
+        // mirror the API's short miss TTL, then passthrough.
         $cache->setNegative($cacheKey, self::MISS_TTL);
     }
 
@@ -180,33 +216,45 @@ class Citecue extends Module
      * Proxies /llms.txt from the delivery API, for every visitor (the feed is
      * meant to be fetchable by anything, not just registered crawlers). The
      * body is served from local cache within a short freshness window and
-     * revalidated with the ETag afterwards; a stale copy is served when the
-     * API is unreachable. Falls through (PrestaShop 404) when the project has
-     * llms.txt serving disabled.
+     * revalidated with the ETag afterwards. A stale copy is served only while
+     * the API is down (transport failure, 429, 5xx); a 404 (llms.txt off) or a
+     * 401 (key revoked) drops it and caches the miss, so the shop answers its
+     * own 404.
      *
+     * @param string $apiBase
      * @param string $apiKey
      * @param string $projectKey
      * @param string $method
      */
-    private function serveLlmsTxt($apiKey, $projectKey, $method)
+    private function serveLlmsTxt($apiBase, $apiKey, $projectKey, $method)
     {
         $cache = new CitecueCache();
         $cacheKey = 'llmstxt|' . $projectKey;
         $entry = $cache->get($cacheKey);
+        $hasBody = $entry !== null && empty($entry['miss']) && $entry['body'] !== '';
 
         if ($entry !== null && !empty($entry['miss'])) {
             return;
         }
-        if ($entry !== null && (int) $entry['expires'] > time() && $entry['body'] !== '') {
-            $this->emit($entry['body'], 'text/plain; charset=utf-8', $entry['etag'], null, $method);
+        if ($hasBody && (int) $entry['expires'] > time()) {
+            $this->emitLlmsTxt($entry['body'], $entry['etag'], $method);
+        }
+        if ($this->isBreakerOpen($cache, $projectKey)) {
+            if ($hasBody) {
+                $this->emitLlmsTxt($entry['body'], $entry['etag'], $method);
+            }
+
+            return;
         }
 
-        $etag = ($entry !== null && !empty($entry['etag']) && $entry['body'] !== '') ? $entry['etag'] : null;
-        $response = CitecueClient::getLlmsTxt($this->apiBase(), $apiKey, $projectKey, $etag);
+        $etag = ($hasBody && !empty($entry['etag'])) ? $entry['etag'] : null;
+        $response = CitecueClient::getLlmsTxt($apiBase, $apiKey, $projectKey, $etag);
 
-        if ($response === null) {
-            if ($entry !== null && $entry['body'] !== '') {
-                $this->emit($entry['body'], 'text/plain; charset=utf-8', $entry['etag'], null, $method);
+        if ($response === null || $this->isOutage($response['status'])) {
+            // API down: trip the breaker and serve the last good copy.
+            $this->tripBreaker($cache, $projectKey);
+            if ($hasBody) {
+                $this->emitLlmsTxt($entry['body'], $entry['etag'], $method);
             }
 
             return;
@@ -215,27 +263,80 @@ class Citecue extends Module
         if ($response['status'] === 200 && $response['body'] !== '') {
             $newEtag = isset($response['headers']['etag']) ? $response['headers']['etag'] : null;
             $cache->setPositive($cacheKey, $newEtag, $response['body'], null, self::LLMSTXT_FRESH_TTL);
-            $this->emit($response['body'], 'text/plain; charset=utf-8', $newEtag, null, $method);
+            $this->emitLlmsTxt($response['body'], $newEtag, $method);
         }
 
-        if ($response['status'] === 304 && $entry !== null && $entry['body'] !== '') {
+        if ($response['status'] === 304 && $hasBody) {
             $cache->refresh($cacheKey, $entry, self::LLMSTXT_FRESH_TTL);
-            $this->emit($entry['body'], 'text/plain; charset=utf-8', $entry['etag'], null, $method);
+            $this->emitLlmsTxt($entry['body'], $entry['etag'], $method);
         }
 
-        if ($response['status'] === 404) {
-            // Disabled/unknown (the API's miss sentinel): cache the miss so
-            // the shop 404s cheaply, matching the freshness window.
-            $cache->setNegative($cacheKey, self::LLMSTXT_FRESH_TTL);
+        // 404 (llms.txt off or unknown project), 401 (key revoked), a 304
+        // without a cached body, or any other client error: the miss replaces
+        // any cached copy, so a stale llms.txt is never served after it.
+        $cache->setNegative($cacheKey, self::MISS_TTL);
+    }
 
-            return;
+    /**
+     * @param string $body
+     * @param string|null $etag
+     * @param string $method
+     */
+    private function emitLlmsTxt($body, $etag, $method)
+    {
+        $this->emit($body, 'text/plain; charset=utf-8', $etag, null, $method, 'no-cache');
+    }
+
+    /**
+     * A transport failure is null; these statuses mean the API is down.
+     *
+     * @param int $status
+     *
+     * @return bool
+     */
+    private function isOutage($status)
+    {
+        return $status === 429 || $status >= 500;
+    }
+
+    /**
+     * @param CitecueCache $cache
+     * @param string $projectKey
+     *
+     * @return bool
+     */
+    private function isBreakerOpen(CitecueCache $cache, $projectKey)
+    {
+        $state = $cache->get('breaker|' . $projectKey);
+
+        return $state !== null && !empty($state['miss']);
+    }
+
+    /**
+     * @param CitecueCache $cache
+     * @param string $projectKey
+     */
+    private function tripBreaker(CitecueCache $cache, $projectKey)
+    {
+        $cache->setNegative('breaker|' . $projectKey, self::BREAKER_TTL);
+    }
+
+    /**
+     * The API's Content-Type when it is one of the two representations it
+     * serves, html otherwise.
+     *
+     * @param string|null $contentType
+     *
+     * @return string
+     */
+    private function pageContentType($contentType)
+    {
+        $contentType = trim((string) $contentType);
+        if (preg_match('#^text/(html|markdown)\s*(;\s*charset=[A-Za-z0-9_\-]+)?$#i', $contentType)) {
+            return $contentType;
         }
 
-        // Transient upstream failure (429/5xx/unexpected): keep the cached
-        // entry and serve it stale when available; never poison the cache.
-        if ($entry !== null && $entry['body'] !== '') {
-            $this->emit($entry['body'], 'text/plain; charset=utf-8', $entry['etag'], null, $method);
-        }
+        return 'text/html; charset=utf-8';
     }
 
     /**
@@ -246,11 +347,12 @@ class Citecue extends Module
      * @param string|null $etag
      * @param string|null $mode
      * @param string $method
+     * @param string $cacheControl
      */
-    private function emit($body, $contentType, $etag, $mode, $method)
+    private function emit($body, $contentType, $etag, $mode, $method, $cacheControl)
     {
         header('Content-Type: ' . $contentType);
-        header('Cache-Control: no-cache');
+        header('Cache-Control: ' . $cacheControl);
         if ($etag) {
             header('ETag: ' . $etag);
         }
@@ -265,13 +367,49 @@ class Citecue extends Module
     }
 
     /**
-     * @return string
+     * The API base URL, or null when the stored value may not receive the
+     * API key (not https, not a trusted host, or a private/reserved IP).
+     *
+     * @return string|null
      */
     private function apiBase()
     {
-        $base = trim((string) Configuration::get(self::CONF_API_BASE));
+        $base = $this->configuredApiBase();
+
+        return CitecueEndpoint::isConfiguredAllowed($base) ? $base : null;
+    }
+
+    /**
+     * The stored API base URL as entered, default when empty.
+     *
+     * @return string
+     */
+    private function configuredApiBase()
+    {
+        $base = rtrim(trim((string) Configuration::get(self::CONF_API_BASE)), '/');
 
         return $base !== '' ? $base : self::DEFAULT_API_BASE;
+    }
+
+    /**
+     * @param string|null $reason a CitecueEndpoint::rejectionReason() code
+     *
+     * @return string
+     */
+    private function baseUrlError($reason)
+    {
+        switch ($reason) {
+            case 'not_https':
+                return $this->l('The API base URL must use https://, so the API key is never sent in cleartext.');
+            case 'credentials':
+                return $this->l('The API base URL must not contain a user name or password.');
+            case 'blocked_ip':
+                return $this->l('The API base URL points to a private, loopback, link-local or reserved IP address. Use the public host name of your CiteCue instance.');
+            case 'not_listed':
+                return $this->l('The API base URL\'s host is not a trusted API host. Add it to "Trusted API hosts" first (only for a self-hosted CiteCue instance).');
+            default:
+                return $this->l('The API base URL is not a valid URL.');
+        }
     }
 
     /**
@@ -347,17 +485,38 @@ class Citecue extends Module
      */
     private function processConfigSubmit()
     {
-        $apiBase = trim((string) Tools::getValue('CITECUE_API_BASE'));
+        $apiBase = rtrim(trim((string) Tools::getValue('CITECUE_API_BASE')), '/');
         if ($apiBase === '') {
             $apiBase = self::DEFAULT_API_BASE;
         }
-        if (!Validate::isAbsoluteUrl($apiBase)) {
-            return $this->displayError($this->l('The API base URL is not a valid URL.'));
+        $hosts = CitecueEndpoint::normalizeHostList((string) Tools::getValue('CITECUE_ALLOWED_HOSTS'));
+        $reason = CitecueEndpoint::rejectionReason($apiBase, $hosts);
+        if ($reason !== null) {
+            return $this->displayError($this->baseUrlError($reason));
         }
 
+        // The key is never rendered back into the form: an empty field
+        // keeps the saved key.
+        $apiKey = trim((string) Tools::getValue('CITECUE_API_KEY'));
+        if ($apiKey !== '' && !CitecueKeyStore::isWellFormed($apiKey)) {
+            return $this->displayError($this->l('That does not look like a CiteCue API key. Paste the full ck_live_… key.'));
+        }
+        // Pointing the saved key at a different API (other than the
+        // default) takes the key itself, so someone who can open this page
+        // but never saw the key can't redirect it to a host of their choosing.
+        if ($apiKey === '' && CitecueKeyStore::hasStored()
+            && $apiBase !== $this->configuredApiBase() && $apiBase !== self::DEFAULT_API_BASE) {
+            return $this->displayError($this->l('Enter the API key again to change the API base URL.'));
+        }
+
+        $extraHosts = array_values(array_diff($hosts, CitecueEndpoint::normalizeHostList('')));
+
         Configuration::updateValue(self::CONF_ENABLED, (int) Tools::getValue('CITECUE_ENABLED'));
-        Configuration::updateValue(self::CONF_API_BASE, rtrim($apiBase, '/'));
-        Configuration::updateValue(self::CONF_API_KEY, trim((string) Tools::getValue('CITECUE_API_KEY')));
+        Configuration::updateValue(self::CONF_API_BASE, $apiBase);
+        Configuration::updateValue(self::CONF_ALLOWED_HOSTS, implode(', ', $extraHosts));
+        if ($apiKey !== '') {
+            CitecueKeyStore::set($apiKey);
+        }
         Configuration::updateValue(self::CONF_PROJECT_KEY, trim((string) Tools::getValue('CITECUE_PROJECT_KEY')));
         Configuration::updateValue(self::CONF_LLMSTXT, (int) Tools::getValue('CITECUE_LLMSTXT'));
 
@@ -379,26 +538,43 @@ class Citecue extends Module
      */
     private function renderStatusPanel()
     {
-        $apiKey = trim((string) Configuration::get(self::CONF_API_KEY));
+        $apiKey = CitecueKeyStore::get();
+        if ($apiKey === '' && CitecueKeyStore::hasStored()) {
+            return $this->displayError(
+                $this->l('The saved API key can no longer be decrypted (the shop\'s cookie key may have changed). Paste the key again.')
+            );
+        }
         if ($apiKey === '') {
             return $this->renderInfo(
-                $this->l('Enter your CiteCue organization API key (ck_live_…) to connect. You can create one in the CiteCue dashboard under Settings → API keys.')
+                $this->l('Enter your CiteCue organization API key (ck_live_…) to connect. You can create one in the CiteCue dashboard under API & MCP access.')
             );
         }
 
-        $response = CitecueClient::getConfig($this->apiBase(), $apiKey);
+        $apiBase = $this->apiBase();
+        if ($apiBase === null) {
+            $reason = CitecueEndpoint::rejectionReason($this->configuredApiBase(), CitecueEndpoint::configuredHosts());
+
+            return $this->displayError(
+                $this->baseUrlError($reason) . ' ' . $this->l('Nothing is sent to the CiteCue API until this is fixed.')
+            );
+        }
+
+        $response = CitecueClient::getConfig($apiBase, $apiKey);
         if ($response === null) {
             return $this->displayWarning($this->l('Could not reach the CiteCue API. Check the API base URL and your server\'s outbound connectivity.'));
         }
         if ($response['status'] === 401) {
-            return $this->displayError($this->l('The CiteCue API rejected this API key. Check that the key is active and copied in full.'));
+            return $this->displayError($this->l('The CiteCue API rejected this API key. Check that the key is active on the API & MCP access page and copied in full.'));
+        }
+        if ($response['status'] === 429 || $response['status'] >= 500) {
+            return $this->displayWarning($this->l('The CiteCue API is temporarily unavailable. Crawlers get your regular pages until it is back; try again in a minute.'));
         }
         $decoded = json_decode($response['body'], true);
         if ($response['status'] !== 200 || !is_array($decoded) || !isset($decoded['projects']) || !is_array($decoded['projects'])) {
             return $this->displayWarning($this->l('Unexpected response from the CiteCue API.'));
         }
 
-        CitecueCrawlers::maybeRefresh($this->apiBase());
+        CitecueCrawlers::maybeRefresh($apiBase);
 
         $projects = $decoded['projects'];
         $projectKey = trim((string) Configuration::get(self::CONF_PROJECT_KEY));
@@ -494,6 +670,7 @@ class Citecue extends Module
      */
     private function renderForm()
     {
+        $savedKey = CitecueKeyStore::get();
         $form = array(
             'form' => array(
                 'legend' => array(
@@ -516,7 +693,11 @@ class Citecue extends Module
                         'type' => 'text',
                         'label' => $this->l('Organization API key'),
                         'name' => 'CITECUE_API_KEY',
-                        'desc' => $this->l('Your ck_live_… key from the CiteCue dashboard (Settings → API keys).'),
+                        'autocomplete' => false,
+                        'placeholder' => $savedKey !== '' ? CitecueKeyStore::mask($savedKey) : 'ck_live_…',
+                        'desc' => $savedKey !== ''
+                            ? sprintf($this->l('A key is saved (%s). Leave this empty to keep it, or paste a new ck_live_… key from the CiteCue dashboard (API & MCP access) to replace it.'), CitecueKeyStore::mask($savedKey))
+                            : $this->l('Your ck_live_… key from the CiteCue dashboard (API & MCP access).'),
                     ),
                     array(
                         'type' => 'text',
@@ -528,7 +709,13 @@ class Citecue extends Module
                         'type' => 'text',
                         'label' => $this->l('API base URL'),
                         'name' => 'CITECUE_API_BASE',
-                        'desc' => sprintf($this->l('Default: %s. Only change this for a self-hosted CiteCue instance.'), self::DEFAULT_API_BASE),
+                        'desc' => sprintf($this->l('Default: %s. Only change this for a self-hosted CiteCue instance. It must use https:// and its host must be a trusted API host; changing it requires entering the API key again.'), self::DEFAULT_API_BASE),
+                    ),
+                    array(
+                        'type' => 'text',
+                        'label' => $this->l('Trusted API hosts'),
+                        'name' => 'CITECUE_ALLOWED_HOSTS',
+                        'desc' => $this->l('Only for a self-hosted CiteCue instance: extra host names the API key may be sent to, comma-separated. app.citecue.com is always trusted. Private, loopback and reserved IP addresses are always refused.'),
                     ),
                     array(
                         'type' => 'switch',
@@ -561,9 +748,11 @@ class Citecue extends Module
         $helper->tpl_vars = array(
             'fields_value' => array(
                 'CITECUE_ENABLED' => (int) Configuration::get(self::CONF_ENABLED),
-                'CITECUE_API_KEY' => (string) Configuration::get(self::CONF_API_KEY),
+                // never echo the key back into the page
+                'CITECUE_API_KEY' => '',
                 'CITECUE_PROJECT_KEY' => (string) Configuration::get(self::CONF_PROJECT_KEY),
-                'CITECUE_API_BASE' => (string) $this->apiBase(),
+                'CITECUE_API_BASE' => $this->configuredApiBase(),
+                'CITECUE_ALLOWED_HOSTS' => (string) Configuration::get(self::CONF_ALLOWED_HOSTS),
                 'CITECUE_LLMSTXT' => (int) Configuration::get(self::CONF_LLMSTXT),
             ),
             'languages' => is_object($this->context->controller) ? $this->context->controller->getLanguages() : array(),
